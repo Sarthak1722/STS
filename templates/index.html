@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Real-time Transcription & Speech</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #45a049; }
+        button:disabled { background: #cccccc; cursor: not-allowed; }
+        #transcript { margin: 20px 0; border: 1px solid #ddd; padding: 10px; min-height: 100px; }
+        .status { color: #666; margin: 10px 0; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>Real-time Transcription & Speech</h1>
+        <button id="startBtn" onclick="startRecording()">Start Recording</button>
+        <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
+        <div class="status" id="status"></div>
+        <div id="transcript"></div>
+        <audio id="audioPlayer" controls></audio>
+    </div>
+
+    <script>
+        let socket = null;
+        let audioContext = null;
+        let audioStream = null;
+        let workletNode = null;
+        
+        const transcriptDiv = document.getElementById('transcript');
+        const statusElement = document.getElementById('status');
+        const audioPlayer = document.getElementById('audioPlayer');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+
+        // Audio worklet processor code
+        const workletCode = `
+            class AudioProcessor extends AudioWorkletProcessor {
+                constructor() {
+                    super();
+                    this.buffer = new Float32Array(4096);
+                    this.bufferIndex = 0;
+                }
+
+                process(inputs, outputs) {
+                    const input = inputs[0][0];
+                    if (!input) return true;
+
+                    // Fill buffer
+                    for (let i = 0; i < input.length; i++) {
+                        this.buffer[this.bufferIndex++] = input[i];
+                        
+                        if (this.bufferIndex >= this.buffer.length) {
+                            // Convert and send buffer
+                            const audioData = this.convertFloat32ToInt16(this.buffer);
+                            this.port.postMessage({ audioData });
+                            
+                            // Reset buffer
+                            this.bufferIndex = 0;
+                        }
+                    }
+                    return true;
+                }
+
+                convertFloat32ToInt16(float32Array) {
+                    const int16Array = new Int16Array(float32Array.length);
+                    for (let i = 0; i < float32Array.length; i++) {
+                        const s = Math.max(-1, Math.min(1, float32Array[i]));
+                        int16Array[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                    }
+                    return int16Array;
+                }
+            }
+
+            registerProcessor('audio-processor', AudioProcessor);
+        `;
+
+        function initializeSocket() {
+            socket = io('http://localhost:5000');
+
+            socket.on('connect', () => {
+                statusElement.textContent = 'Connected to server';
+            });
+
+            socket.on('disconnect', () => {
+                statusElement.textContent = 'Disconnected from server';
+                stopRecording();
+            });
+
+            socket.on('transcript', (data) => {
+                if (data.is_final) {
+                    transcriptDiv.innerHTML += `<div><strong>${data.text}</strong></div>`;
+                } else {
+                    let lastChild = transcriptDiv.lastElementChild;
+                    if (lastChild && !lastChild.querySelector('strong')) {
+                        lastChild.textContent = data.text;
+                    } else {
+                        transcriptDiv.innerHTML += `<div>${data.text}</div>`;
+                    }
+                }
+            });
+
+            socket.on('audio', (data) => {
+                const audioData = data.data;
+                const blob = new Blob([Uint8Array.from(atob(audioData), c => c.charCodeAt(0))], 
+                    { type: 'audio/mpeg' });
+                const audioUrl = URL.createObjectURL(blob);
+                audioPlayer.src = audioUrl;
+                audioPlayer.play().catch(console.error);
+            });
+
+            socket.on('status', (data) => {
+                statusElement.textContent = data.message;
+            });
+
+            socket.on('error', (data) => {
+                statusElement.textContent = data.message;
+                statusElement.style.color = 'red';
+                setTimeout(() => {
+                    statusElement.style.color = 'inherit';
+                }, 5000);
+            });
+        }
+
+        async function startRecording() {
+            try {
+                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                audioContext = new AudioContext();
+                
+                // Create a new AudioWorklet
+                const blob = new Blob([workletCode], { type: 'application/javascript' });
+                const workletUrl = URL.createObjectURL(blob);
+                await audioContext.audioWorklet.addModule(workletUrl);
+
+                // Create and connect nodes
+                const source = audioContext.createMediaStreamSource(audioStream);
+                workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                
+                workletNode.port.onmessage = (event) => {
+                    if (socket && socket.connected && event.data.audioData) {
+                        socket.emit('audio_data', {
+                            audio: btoa(String.fromCharCode.apply(null, new Uint8Array(event.data.audioData.buffer)))
+                        });
+                    }
+                };
+
+                source.connect(workletNode);
+                workletNode.connect(audioContext.destination);
+
+                if (!socket) {
+                    initializeSocket();
+                }
+
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                statusElement.textContent = 'Recording...';
+                transcriptDiv.innerHTML = '';
+                audioPlayer.src = '';
+
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                statusElement.textContent = 'Error accessing microphone';
+                statusElement.style.color = 'red';
+            }
+        }
+
+        function stopRecording() {
+            if (workletNode) {
+                workletNode.disconnect();
+                workletNode = null;
+            }
+
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            if (socket) {
+                socket.disconnect();
+                socket = null;
+            }
+
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            statusElement.textContent = 'Recording stopped';
+        }
+    </script>
+</body>
+</html>
