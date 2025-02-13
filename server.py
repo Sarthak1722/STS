@@ -2,12 +2,13 @@ from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import assemblyai as aai
+from openai import OpenAI
+from elevenlabs.client import ElevenLabs
 import threading
-import requests
 import base64
-import json
 import os
 from dotenv import load_dotenv
+from collections import deque
 
 load_dotenv()
 
@@ -15,15 +16,18 @@ app = Flask(__name__)
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
-# API Keys
+# API Configurations
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
-ELEVEN_LABS_URL = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+ELEVENLABS_MODEL = "eleven_turbo_v2"
 
-aai.settings.api_key = os.getenv("AAI_API_KEY")
+aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
 class WebSocketTranscriber:
     def __init__(self, socket_id):
         self.socket_id = socket_id
+        self.history = deque(maxlen=4)
         self.transcriber = aai.RealtimeTranscriber(
             on_data=self.on_data,
             on_error=self.on_error,
@@ -37,58 +41,73 @@ class WebSocketTranscriber:
         socketio.emit('status', {'message': 'Session started'}, room=self.socket_id)
 
     def on_data(self, transcript: aai.RealtimeTranscript):
-        if transcript.text:
-            is_final = isinstance(transcript, aai.RealtimeFinalTranscript)
+        if transcript.text and isinstance(transcript, aai.RealtimeFinalTranscript):
+            # is_final = isinstance(transcript, aai.RealtimeFinalTranscript)
             socketio.emit('transcript', {
                 'text': transcript.text,
-                'is_final': is_final
+                'is_final': True
             }, room=self.socket_id)
             
-            if is_final:
-                self.synthesize_speech(transcript.text)
+            # if is_final:
+            self.process_gpt_response(transcript.text)
 
-    def synthesize_speech(self, text):
-        def run():
+    def process_gpt_response(self, user_text):
+        def generate_and_synthesize():
             try:
-                headers = {
-                    "Accept": "audio/mpeg",
-                    "Content-Type": "application/json",
-                    "xi-api-key": os.getenv("ELEVEN_LABS_API_KEY")
-                }
-                payload = {
-                    "text": text,
-                    "model_id": "eleven_monolingual_v1",
-                    "voice_settings": {
-                        "stability": 0.5,
-                        "similarity_boost": 0.5
-                    }
-                }
+                # Generate GPT response
+                self.history.append({"role": "user", "content": user_text})
+                messages = [
+                    {"role": "system", "content": "Respond concisely and conversationally. Keep the response short to maximum 2-3 sentences."},
+                    *list(self.history)
+                ]
+                
+                gpt_response = openai_client.chat.completions.create(
+                    model="gpt-4",
+                    messages=messages,
+                    max_tokens=100,
+                    temperature=0.7
+                )
+                response_text = gpt_response.choices[0].message.content
+                self.history.append({"role": "assistant", "content": response_text})
 
-                response = requests.post(ELEVEN_LABS_URL, json=payload, headers=headers)
-                response.raise_for_status()
-
-                audio_data = base64.b64encode(response.content).decode('utf-8')
-                socketio.emit('audio', {
-                    'data': audio_data,
-                    'text': text
-                }, room=self.socket_id)
+                # Convert text to audio bytes
+                audio_stream = elevenlabs_client.text_to_speech.convert(
+                    voice_id=VOICE_ID,
+                    text=response_text,
+                    model_id=ELEVENLABS_MODEL,
+                )
+                
+                # Read all audio chunks into bytes
+                audio_bytes = b""
+                for chunk in audio_stream:
+                    if chunk:
+                        audio_bytes += chunk
+                
+                # Encode and send audio
+                audio_data = base64.b64encode(audio_bytes).decode('utf-8')
+                
+                with app.app_context():
+                    socketio.emit('audio', {
+                        'data': audio_data,
+                        'text': response_text
+                    }, room=self.socket_id)
+                    socketio.emit('assistant_response', {
+                        'text': response_text
+                    }, room=self.socket_id)
 
             except Exception as e:
-                socketio.emit('error', {
-                    'message': f"Synthesis Error: {str(e)}"
-                }, room=self.socket_id)
+                with app.app_context():
+                    socketio.emit('error', {'message': f"Error: {str(e)}"}, room=self.socket_id)
 
-        threading.Thread(target=run).start()
+        threading.Thread(target=generate_and_synthesize).start()
 
     def on_error(self, error: aai.RealtimeError):
-        socketio.emit('error', {
-            'message': str(error)
-        }, room=self.socket_id)
+        with app.app_context():
+            socketio.emit('error', {'message': str(error)}, room=self.socket_id)
 
     def on_close(self):
-        socketio.emit('status', {
-            'message': 'Session closed'
-        }, room=self.socket_id)
+        with app.app_context():
+            socketio.emit('status', {'message': 'Session closed'}, room=self.socket_id)
 
     def process_audio(self, audio_data):
         self.transcriber.stream(audio_data)
@@ -101,7 +120,6 @@ class WebSocketTranscriber:
         self.active = False
         self.transcriber.close()
 
-# Store active transcribers
 transcribers = {}
 
 @app.route('/')

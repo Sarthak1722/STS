@@ -1,26 +1,126 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Real-time Transcription & Speech</title>
+    <title>AI Conversation Assistant</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
-        .container { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        button { background: #4CAF50; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; }
-        button:hover { background: #45a049; }
-        button:disabled { background: #cccccc; cursor: not-allowed; }
-        #transcript { margin: 20px 0; border: 1px solid #ddd; padding: 10px; min-height: 100px; }
-        .status { color: #666; margin: 10px 0; }
+        body {
+            background-color: #f0f2f5;
+            min-height: 100vh;
+        }
+        
+        .chat-container {
+            max-width: 800px;
+            margin: 2rem auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 2px 15px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .chat-header {
+            background: #2563eb;
+            color: white;
+            padding: 1.5rem;
+            text-align: center;
+        }
+
+        .chat-messages {
+            height: 60vh;
+            overflow-y: auto;
+            padding: 1.5rem;
+            background: #f8f9fa;
+        }
+
+        .message {
+            display: flex;
+            margin-bottom: 1.5rem;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        .user-message {
+            justify-content: flex-end;
+        }
+
+        .assistant-message .message-content {
+            background: white;
+            color: #1f2937;
+        }
+
+        .user-message .message-content {
+            background: #2563eb;
+            color: white;
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 1rem 1.5rem;
+            border-radius: 1.5rem;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+
+        .avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            margin: 0 1rem;
+            flex-shrink: 0;
+        }
+
+        .controls {
+            padding: 1.5rem;
+            background: white;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .status-indicator {
+            padding: 0.5rem 1rem;
+            background: #e5e7eb;
+            border-radius: 2rem;
+            font-size: 0.9rem;
+            margin-bottom: 1rem;
+        }
+
+        #transcript {
+            display: none;
+        }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
 </head>
 <body>
-    <div class="container">
-        <h1>Real-time Transcription & Speech</h1>
-        <button id="startBtn" onclick="startRecording()">Start Recording</button>
-        <button id="stopBtn" onclick="stopRecording()" disabled>Stop Recording</button>
-        <div class="status" id="status"></div>
-        <div id="transcript"></div>
-        <audio id="audioPlayer" controls></audio>
+    <div class="chat-container">
+        <div class="chat-header">
+            <h2 class="mb-0">AI Conversation Assistant</h2>
+            <div class="status-indicator mt-2" id="status">Disconnected</div>
+        </div>
+
+        <div class="chat-messages" id="chatMessages">
+            <div class="message assistant-message">
+                <div class="avatar bg-primary text-white d-flex align-items-center justify-content-center">
+                    <i class="fas fa-robot"></i>
+                </div>
+                <div class="message-content">
+                    Hello! How can I help you today?
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="d-flex gap-2">
+                <button id="startBtn" onclick="startRecording()" class="btn btn-primary flex-grow-1">
+                    <i class="fas fa-microphone"></i> Start Conversation
+                </button>
+                <button id="stopBtn" onclick="stopRecording()" class="btn btn-danger" disabled>
+                    <i class="fas fa-stop"></i> Stop
+                </button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -78,40 +178,65 @@
         `;
 
         function initializeSocket() {
-            // socket = io('http://localhost:5000');
-            socket = io('http://ec2-44-223-67-245.compute-1.amazonaws.com:5000');
+            socket = io('http://localhost:5000');
+            // socket = io('http://ec2-44-223-67-245.compute-1.amazonaws.com:5000');
 
 
 
+            socket.on('transcript', (data) => {
+                const chatMessages = document.getElementById('chatMessages');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message user-message';
+                
+                messageDiv.innerHTML = `
+                    <div class="message-content">
+                        ${data.text}
+                    </div>
+                    <div class="avatar bg-primary text-white d-flex align-items-center justify-content-center">
+                        <i class="fas fa-user"></i>
+                    </div>
+                `;
+                
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            });
+
+            socket.on('assistant_response', (data) => {
+                const chatMessages = document.getElementById('chatMessages');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message assistant-message';
+                
+                messageDiv.innerHTML = `
+                    <div class="avatar bg-primary text-white d-flex align-items-center justify-content-center">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        ${data.text}
+                    </div>
+                `;
+                
+                chatMessages.appendChild(messageDiv);
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            });
+
+            // Update status element styling
             socket.on('connect', () => {
-                statusElement.textContent = 'Connected to server';
+                statusElement.textContent = 'Connected';
+                statusElement.style.background = '#d1fae5';
+                statusElement.style.color = '#065f46';
             });
 
             socket.on('disconnect', () => {
-                statusElement.textContent = 'Disconnected from server';
-                stopRecording();
+                statusElement.textContent = 'Disconnected';
+                statusElement.style.background = '#fee2e2';
+                statusElement.style.color = '#991b1b';
             });
 
-            socket.on('transcript', (data) => {
-                if (data.is_final) {
-                    transcriptDiv.innerHTML += `<div><strong>${data.text}</strong></div>`;
-                } else {
-                    let lastChild = transcriptDiv.lastElementChild;
-                    if (lastChild && !lastChild.querySelector('strong')) {
-                        lastChild.textContent = data.text;
-                    } else {
-                        transcriptDiv.innerHTML += `<div>${data.text}</div>`;
-                    }
-                }
-            });
 
             socket.on('audio', (data) => {
-                const audioData = data.data;
-                const blob = new Blob([Uint8Array.from(atob(audioData), c => c.charCodeAt(0))], 
-                    { type: 'audio/mpeg' });
-                const audioUrl = URL.createObjectURL(blob);
-                audioPlayer.src = audioUrl;
-                audioPlayer.play().catch(console.error);
+                // Play audio
+                const audio = new Audio('data:audio/mpeg;base64,' + data.data);
+                audio.play();
             });
 
             socket.on('status', (data) => {
@@ -119,11 +244,10 @@
             });
 
             socket.on('error', (data) => {
+                console.error('Socket error:', data.message);
                 statusElement.textContent = data.message;
-                statusElement.style.color = 'red';
-                setTimeout(() => {
-                    statusElement.style.color = 'inherit';
-                }, 5000);
+                statusElement.style.background = '#fee2e2';
+                statusElement.style.color = '#991b1b';
             });
         }
 
