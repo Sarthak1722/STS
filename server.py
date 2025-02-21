@@ -20,9 +20,9 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 ELEVENLABS_MODEL = "eleven_turbo_v2"
 
-aai.settings.api_key = "372010b5feaa4fc5871aa742e32e992c"
+aai.settings.api_key = os.getenv("ASSEMBLYAI_API_KEY")
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-elevenlabs_client = ElevenLabs(api_key="sk_e2623168a6341fa87a3d0fc200d47145a18b8c7a7a114511")
+elevenlabs_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY"))
 
 class WebSocketTranscriber:
     def __init__(self, socket_id):
