@@ -1,7 +1,7 @@
 import openai
 
 # Replace with your OpenAI API key
-client = openai.OpenAI(api_key="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")
+client = openai.OpenAI(api_key="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")
 
 try:
     response = client.chat.completions.create(
@@ -13,3 +13,21 @@ except openai.AuthenticationError:
     print("Invalid API key!")
 except Exception as e:
     print("Error:", e)
+
+
+
+# from openai import OpenAI
+
+# client = OpenAI(
+#   api_key="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"
+# )
+
+# completion = client.chat.completions.create(
+#   model="gpt-4o-mini",
+#   store=True,
+#   messages=[
+#     {"role": "user", "content": "write a haiku about ai"}
+#   ]
+# )
+
+# print(completion.choices[0].message);

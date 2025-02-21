@@ -21,7 +21,7 @@ VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
 ELEVENLABS_MODEL = "eleven_turbo_v2"
 
 aai.settings.api_key = "372010b5feaa4fc5871aa742e32e992c"
-openai_client = OpenAI(api_key="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")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 elevenlabs_client = ElevenLabs(api_key="sk_e2623168a6341fa87a3d0fc200d47145a18b8c7a7a114511")
 
 class WebSocketTranscriber:
@@ -62,7 +62,7 @@ class WebSocketTranscriber:
                 ]
                 
                 gpt_response = openai_client.chat.completions.create(
-                    model="gpt-4",
+                    model="gpt-3.5-turbo",
                     messages=messages,
                     max_tokens=100,
                     temperature=0.7
