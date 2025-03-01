@@ -87,8 +87,21 @@
             margin-bottom: 1rem;
         }
 
-        #transcript {
+        .speaking-indicator {
+            margin-left: 0.5rem;
             display: none;
+        }
+
+        .speaking-indicator.active {
+            display: inline-block;
+            color: #ef4444;
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
         }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
@@ -96,7 +109,12 @@
 <body>
     <div class="chat-container">
         <div class="chat-header">
-            <h2 class="mb-0">AI Conversation Assistant</h2>
+            <h2 class="mb-0">
+                AI Conversation Assistant
+                <span class="speaking-indicator" id="speakingIndicator">
+                    <i class="fas fa-volume-up"></i>
+                </span>
+            </h2>
             <div class="status-indicator mt-2" id="status">Disconnected</div>
         </div>
 
@@ -128,27 +146,85 @@
         let audioContext = null;
         let audioStream = null;
         let workletNode = null;
+        let currentAudio = null;
+        let voiceActivityDetected = false;
+        let voiceActivityTimeout = null;
+        let isSpeaking = false;
+        let audioChunks = [];
+        let audioQueue = [];
+        let isPlayingFromQueue = false;
+        let bufferingStrategy = {
+            initialBufferSize: 2,     // Number of chunks to buffer before starting playback
+            minBufferSize: 1,         // Minimum buffer during playback
+            isInitialBuffering: true, // Whether we're in initial buffering phase
+            bufferingTimeout: null,   // Timeout for adaptive buffering
+            networkCondition: 'good'  // Network condition estimation
+        };
         
-        const transcriptDiv = document.getElementById('transcript');
         const statusElement = document.getElementById('status');
-        const audioPlayer = document.getElementById('audioPlayer');
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
-
-        // Audio worklet processor code
+        const speakingIndicator = document.getElementById('speakingIndicator');
+        const chatMessages = document.getElementById('chatMessages');
+    
+        // Enable debugging in the client
+        const DEBUG = true;
+        function debugLog(message) {
+            if (DEBUG) {
+                console.log(`[DEBUG] ${message}`);
+            }
+        }
+    
+        // Audio worklet processor code with improved voice activity detection
         const workletCode = `
             class AudioProcessor extends AudioWorkletProcessor {
                 constructor() {
                     super();
                     this.buffer = new Float32Array(4096);
                     this.bufferIndex = 0;
+                    this.silenceThreshold = 0.025; // Slightly higher threshold
+                    this.voiceDetected = false;
+                    this.voiceFrameCount = 0;
+                    this.silenceFrameCount = 0;
+                    this.lastVoiceDetectionTime = 0;
                 }
 
                 process(inputs, outputs) {
                     const input = inputs[0][0];
                     if (!input) return true;
 
-                    // Fill buffer
+                    // Check for voice activity with improved energy detection
+                    let energy = 0;
+                    for (let i = 0; i < input.length; i++) {
+                        energy += Math.abs(input[i]);
+                    }
+                    
+                    const averageEnergy = energy / input.length;
+                    const hasVoice = averageEnergy > this.silenceThreshold;
+                    
+                    // More responsive voice detection logic
+                    if (hasVoice) {
+                        this.voiceFrameCount++;
+                        this.silenceFrameCount = 0;
+                        
+                        // Faster voice activation (2 frames instead of 3)
+                        if (this.voiceFrameCount > 2 && !this.voiceDetected) {
+                            this.voiceDetected = true;
+                            this.lastVoiceDetectionTime = currentTime;
+                            this.port.postMessage({ voiceDetected: true });
+                        }
+                    } else {
+                        this.silenceFrameCount++;
+                        this.voiceFrameCount = 0;
+                        
+                        // Require more silent frames to consider silence (less jumpy)
+                        if (this.silenceFrameCount > 15 && this.voiceDetected) {
+                            this.voiceDetected = false;
+                            this.port.postMessage({ voiceDetected: false });
+                        }
+                    }
+
+                    // Always fill buffer if active
                     for (let i = 0; i < input.length; i++) {
                         this.buffer[this.bufferIndex++] = input[i];
                         
@@ -176,15 +252,21 @@
 
             registerProcessor('audio-processor', AudioProcessor);
         `;
-
+    
         function initializeSocket() {
+            // Use the current host dynamically
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.hostname + (window.location.port ? `:${window.location.port}` : '');
+            socket = io(`${protocol}//${host}`);
+            
+            // For local development, you can use this instead:
             // socket = io('http://localhost:5000');
-            socket = io('http://ec2-44-223-67-245.compute-1.amazonaws.com:5000');
-
-
-
+    
+            debugLog("Socket initialized");
+    
             socket.on('transcript', (data) => {
-                const chatMessages = document.getElementById('chatMessages');
+                debugLog(`Received transcript: ${data.text}`);
+                
                 const messageDiv = document.createElement('div');
                 messageDiv.className = 'message user-message';
                 
@@ -200,9 +282,10 @@
                 chatMessages.appendChild(messageDiv);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
             });
-
+    
             socket.on('assistant_response', (data) => {
-                const chatMessages = document.getElementById('chatMessages');
+                debugLog(`Received assistant response: ${data.text}`);
+                
                 const messageDiv = document.createElement('div');
                 messageDiv.className = 'message assistant-message';
                 
@@ -217,107 +300,393 @@
                 
                 chatMessages.appendChild(messageDiv);
                 chatMessages.scrollTop = chatMessages.scrollHeight;
+                
+                // Clear any existing audio chunks for new response
+                audioChunks = [];
+                audioQueue = [];
             });
-
+    
             // Update status element styling
             socket.on('connect', () => {
+                debugLog("Socket connected");
                 statusElement.textContent = 'Connected';
                 statusElement.style.background = '#d1fae5';
                 statusElement.style.color = '#065f46';
             });
-
+    
             socket.on('disconnect', () => {
+                debugLog("Socket disconnected");
                 statusElement.textContent = 'Disconnected';
                 statusElement.style.background = '#fee2e2';
                 statusElement.style.color = '#991b1b';
             });
-
-
-            socket.on('audio', (data) => {
-                // Play audio
-                const audio = new Audio('data:audio/mpeg;base64,' + data.data);
-                audio.play();
+    
+            // Update audio_generation_started handler
+            socket.on('audio_generation_started', () => {
+                debugLog("Audio generation started");
+                statusElement.textContent = 'Generating audio response...';
+                
+                // Reset audio state for new generation
+                audioQueue = [];
+                isPlayingFromQueue = false;
+                resetBufferingStrategy();
             });
+            
+            // Handle streaming audio chunks
+            socket.on('audio_chunk', (data) => {
+                debugLog("Received audio chunk");
+                
+                try {
+                    const audioData = 'data:audio/mpeg;base64,' + data.data;
+                    audioQueue.push(audioData);
+                    
+                    // Implement buffering strategy
+                    if (bufferingStrategy.isInitialBuffering) {
+                        // During initial buffering, wait until we have enough chunks
+                        if (audioQueue.length >= bufferingStrategy.initialBufferSize) {
+                            debugLog(`Initial buffer filled with ${audioQueue.length} chunks`);
+                            bufferingStrategy.isInitialBuffering = false;
+                            playNextAudioChunk();
+                        } else {
+                            debugLog(`Buffering: ${audioQueue.length}/${bufferingStrategy.initialBufferSize} chunks`);
+                            statusElement.textContent = `Buffering audio: ${audioQueue.length}/${bufferingStrategy.initialBufferSize}`;
+                        }
+                    } else if (!isPlayingFromQueue && audioQueue.length > bufferingStrategy.minBufferSize) {
+                        // If not currently playing and we have minimum buffer, start playback
+                        playNextAudioChunk();
+                    }
 
+                    // If this is the last chunk, make sure we play everything
+                    if (data.is_last && !isPlayingFromQueue && !bufferingStrategy.isInitialBuffering) {
+                        playNextAudioChunk();
+                    }
+
+                } catch (err) {
+                    debugLog(`Error handling audio chunk: ${err.message}`);
+                }                                                           
+            });
+    
+            // Handle audio completion
+            socket.on('audio_complete', (data) => {
+                debugLog(`Audio streaming complete`);
+                statusElement.textContent = 'Connected';
+                
+                // Ensure we play any remaining buffered chunks
+                if (audioQueue.length > 0 && !isPlayingFromQueue) {
+                    playNextAudioChunk();
+                }
+            });
+    
+            socket.on('audio_interrupted', () => {
+                debugLog("Audio playback interrupted");
+                // Stop any currently playing audio
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio = null;
+                }
+                
+                // Clear audio queue and reset buffering
+                audioQueue = [];
+                isPlayingFromQueue = false;
+                isSpeaking = false;
+                speakingIndicator.classList.remove('active');
+                resetBufferingStrategy();
+                statusElement.textContent = 'Audio interrupted';
+            });
+    
+            socket.on('audio_generation_cancelled', () => {
+                debugLog("Audio generation was cancelled");
+                statusElement.textContent = 'Audio generation cancelled';
+            });
+    
             socket.on('status', (data) => {
+                debugLog(`Status update: ${data.message}`);
                 statusElement.textContent = data.message;
             });
-
+    
             socket.on('error', (data) => {
+                debugLog(`Socket error: ${data.message}`);
                 console.error('Socket error:', data.message);
                 statusElement.textContent = data.message;
                 statusElement.style.background = '#fee2e2';
                 statusElement.style.color = '#991b1b';
             });
         }
+        
+        // Play audio chunks sequentially
+        function playNextAudioChunk() {
+            if (audioQueue.length === 0) {
+                isPlayingFromQueue = false;
+                isSpeaking = false;
+                speakingIndicator.classList.remove('active');
+                
+                // Reset buffering for next audio stream
+                bufferingStrategy.isInitialBuffering = true;
+                return;
+            }
+            
+            // Skip playback if we're below minimum buffer, unless it's the end of the stream
+            if (audioQueue.length < bufferingStrategy.minBufferSize && bufferingStrategy.isInitialBuffering === false) {
+                debugLog(`Buffer too low (${audioQueue.length}), pausing playback`);
+                statusElement.textContent = `Buffering audio: ${audioQueue.length}/${bufferingStrategy.minBufferSize}`;
+                
+                // Set a timeout to check buffer again shortly
+                clearTimeout(bufferingStrategy.bufferingTimeout);
+                bufferingStrategy.bufferingTimeout = setTimeout(() => {
+                    if (audioQueue.length >= bufferingStrategy.minBufferSize) {
+                        playNextAudioChunk();
+                    } else {
+                        // Check again after a short delay
+                        playNextAudioChunk();
+                    }
+                }, 200);
+                
+                return;
+            }
+            
+            isPlayingFromQueue = true;
+            isSpeaking = true;
+            speakingIndicator.classList.add('active');
+            
+            const audioData = audioQueue.shift();
+            currentAudio = new Audio(audioData);
+            
+            // Pre-buffer the next audio chunk when possible
+            if (audioQueue.length > 0) {
+                const nextAudio = new Audio(audioQueue[0]);
+                nextAudio.preload = 'auto';
+            }
+            
+            currentAudio.onended = () => {
+                debugLog("Audio chunk playback completed");
+                currentAudio = null;
+                
+                // Adaptively adjust buffer size based on playback success
+                if (bufferingStrategy.networkCondition === 'poor' && bufferingStrategy.minBufferSize < 3) {
+                    bufferingStrategy.minBufferSize++;
+                    bufferingStrategy.initialBufferSize = Math.max(bufferingStrategy.initialBufferSize, bufferingStrategy.minBufferSize + 1);
+                    debugLog(`Network seems slow, increasing buffer to ${bufferingStrategy.minBufferSize}`);
+                }
+                
+                // Play next chunk
+                playNextAudioChunk();
+            };
+            
+            currentAudio.onerror = (e) => {
+                debugLog(`Audio playback error: ${e.message || 'Unknown error'}`);
+                currentAudio = null;
+                
+                // Mark network condition as poor
+                bufferingStrategy.networkCondition = 'poor';
+                
+                // Adjust buffer size for poor network
+                if (bufferingStrategy.minBufferSize < 3) {
+                    bufferingStrategy.minBufferSize++;
+                    bufferingStrategy.initialBufferSize = Math.max(bufferingStrategy.initialBufferSize, bufferingStrategy.minBufferSize + 1);
+                    debugLog(`Playback error detected, increasing buffer to ${bufferingStrategy.minBufferSize}`);
+                }
+                
+                playNextAudioChunk();
+            };
+            
+            // Handle successful playback
+            let playStartTime = Date.now();
+            
+            currentAudio.play().then(() => {
+                // Update the status during playback
+                statusElement.textContent = 'Playing audio response';
+                
+                // Monitor playback quality
+                currentAudio.addEventListener('timeupdate', function() {
+                    if (currentAudio && currentAudio.duration > 0) {
+                        const playbackProgress = currentAudio.currentTime / currentAudio.duration;
+                        // If we've played more than 80% of the audio without issues, consider network good
+                        if (playbackProgress > 0.8) {
+                            bufferingStrategy.networkCondition = 'good';
+                            
+                            // In good network conditions, we can reduce buffer size
+                            if (bufferingStrategy.minBufferSize > 1 && Date.now() - playStartTime > 3000) {
+                                bufferingStrategy.minBufferSize = Math.max(1, bufferingStrategy.minBufferSize - 1);
+                                bufferingStrategy.initialBufferSize = Math.max(2, bufferingStrategy.initialBufferSize - 1);
+                                debugLog(`Network seems good, reducing buffer to ${bufferingStrategy.minBufferSize}`);
+                            }
+                        }
+                    }
+                });
+            }).catch(err => {
+                debugLog(`Audio playback failed: ${err.message}`);
+                currentAudio = null;
+                
+                // Mark network as poor
+                bufferingStrategy.networkCondition = 'poor';
+                
+                // Adjust buffer size for errors
+                if (bufferingStrategy.minBufferSize < 3) {
+                    bufferingStrategy.minBufferSize++;
+                    bufferingStrategy.initialBufferSize = Math.max(bufferingStrategy.initialBufferSize, bufferingStrategy.minBufferSize + 1);
+                }
+                
+                playNextAudioChunk();
+            });
+        }
 
+        // Add a reset function for the buffer strategy
+        function resetBufferingStrategy() {
+            bufferingStrategy = {
+                initialBufferSize: 2,
+                minBufferSize: 1,
+                isInitialBuffering: true,
+                bufferingTimeout: null,
+                networkCondition: 'good'
+            };
+        }
+
+    
+        function handleVoiceActivity(active) {
+            // Clear any existing timeout
+            if (voiceActivityTimeout) {
+                clearTimeout(voiceActivityTimeout);
+                voiceActivityTimeout = null;
+            }
+            
+            // Use a longer delay for voice detection to avoid false triggers
+            const delay = active ? 500 : 800;  // Longer delay to confirm voice activity
+            
+            voiceActivityTimeout = setTimeout(() => {
+                if (voiceActivityDetected !== active) {
+                    voiceActivityDetected = active;
+                    debugLog(`Voice activity: ${active ? 'detected' : 'stopped'}`);
+                    
+                    // Only send voice activity to server if we're confident it's actual speech
+                    if (socket && socket.connected && (active || !isPlayingFromQueue)) {
+                        socket.emit('voice_activity', { active: active });
+                    }
+                    
+                    // Only interrupt if we're definitely speaking and audio is playing
+                    if (active && isPlayingFromQueue && socket && socket.connected) {
+                        debugLog("Interrupting assistant due to confirmed user speech");
+                        socket.emit('interrupt');
+                        
+                        // Stop current audio playback
+                        if (currentAudio) {
+                            currentAudio.pause();
+                            currentAudio = null;
+                        }
+                        
+                        // Clear audio queue
+                        audioQueue = [];
+                        isPlayingFromQueue = false;
+                        isSpeaking = false;
+                        speakingIndicator.classList.remove('active');
+                    }
+                }
+            }, delay);
+        }   
+    
         async function startRecording() {
             try {
-                audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                audioContext = new AudioContext();
+                debugLog("Starting recording");
+                audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: {
+                        echoCancellation: true,
+                        noiseSuppression: true,
+                        autoGainControl: true
+                    } 
+                });
+                
+                debugLog("Got audio stream");
+                audioContext = new AudioContext({
+                    latencyHint: 'interactive', // Lower latency setting
+                    sampleRate: 44100
+                });
                 
                 // Create a new AudioWorklet
                 const blob = new Blob([workletCode], { type: 'application/javascript' });
                 const workletUrl = URL.createObjectURL(blob);
                 await audioContext.audioWorklet.addModule(workletUrl);
-
+                debugLog("Worklet module added");
+    
                 // Create and connect nodes
                 const source = audioContext.createMediaStreamSource(audioStream);
                 workletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+                debugLog("Worklet node created");
                 
                 workletNode.port.onmessage = (event) => {
+                    if (event.data.voiceDetected !== undefined) {
+                        handleVoiceActivity(event.data.voiceDetected);
+                    }
+                    
                     if (socket && socket.connected && event.data.audioData) {
+                        const audioB64 = btoa(String.fromCharCode.apply(null, new Uint8Array(event.data.audioData.buffer)));
                         socket.emit('audio_data', {
-                            audio: btoa(String.fromCharCode.apply(null, new Uint8Array(event.data.audioData.buffer)))
+                            audio: audioB64
                         });
                     }
                 };
-
+    
                 source.connect(workletNode);
                 workletNode.connect(audioContext.destination);
-
+                debugLog("Audio graph connected");
+    
                 if (!socket) {
                     initializeSocket();
                 }
-
+    
                 startBtn.disabled = true;
                 stopBtn.disabled = false;
                 statusElement.textContent = 'Recording...';
-                transcriptDiv.innerHTML = '';
-                audioPlayer.src = '';
-
+    
             } catch (error) {
                 console.error('Error starting recording:', error);
-                statusElement.textContent = 'Trying to access microphone';
-                statusElement.style.color = 'red';
+                debugLog(`Recording error: ${error.message}`);
+                statusElement.textContent = 'Microphone access error: ' + error.message;
+                statusElement.style.background = '#fee2e2';
+                statusElement.style.color = '#991b1b';
             }
         }
-
+    
         function stopRecording() {
+            debugLog("Stopping recording");
+            
+            // Properly clean up audio resources
             if (workletNode) {
                 workletNode.disconnect();
                 workletNode = null;
             }
-
+    
             if (audioStream) {
                 audioStream.getTracks().forEach(track => track.stop());
                 audioStream = null;
             }
-
+    
             if (audioContext) {
                 audioContext.close();
                 audioContext = null;
             }
-
+    
             if (socket) {
                 socket.disconnect();
                 socket = null;
             }
-
+    
+            if (currentAudio) {
+                currentAudio.pause();
+                currentAudio = null;
+            }
+    
+            // Reset all state variables
+            voiceActivityDetected = false;
+            isSpeaking = false;
+            isPlayingFromQueue = false;
+            audioQueue = [];
+            audioChunks = [];
+            speakingIndicator.classList.remove('active');
+            
             startBtn.disabled = false;
             stopBtn.disabled = true;
             statusElement.textContent = 'Recording stopped';
+            debugLog("Recording stopped completely");
         }
     </script>
 </body>
-</html>
+</html
